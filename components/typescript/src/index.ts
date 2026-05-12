@@ -1,6 +1,6 @@
-import "dotenv/config";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { config as loadEnv } from "dotenv";
 import { createAgent, AIMessage, ToolMessage } from "langchain";
 import path from "node:path";
 import { Hono } from "hono";
@@ -18,11 +18,18 @@ import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import { CARTESIA_TTS_SYSTEM_PROMPT, CartesiaTTS } from "./cartesia";
 import { AssemblyAISTT } from "./assemblyai/index";
-import type { VoiceAgentEvent } from "./types";
+import type {
+  KitchenClientEvent,
+  KitchenOrder,
+  KitchenOrderStatus,
+  KitchenServerEvent,
+  VoiceAgentEvent,
+} from "./types";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const STATIC_DIR = path.join(__dirname, "../../web/dist");
+loadEnv({ path: path.join(__dirname, "../../../.env") });
 const PORT = parseInt(process.env.PORT ?? "8000");
 
 if (!existsSync(STATIC_DIR)) {
@@ -37,6 +44,53 @@ const app = new Hono();
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 
 app.use("/*", cors());
+
+const kitchenOrders: KitchenOrder[] = [];
+const kitchenClients = new Set<WSContext<WebSocket>>();
+const validKitchenStatuses: KitchenOrderStatus[] = [
+  "nuevo",
+  "en preparación",
+  "listo",
+];
+
+function extractOrderItems(orderSummary: string): string[] {
+  return orderSummary
+    .split(/\n|,|;|\sy\s/gi)
+    .map((item) => item.replace(/^[-*]\s*/, "").trim())
+    .filter(Boolean);
+}
+
+function broadcastKitchenEvent(event: KitchenServerEvent) {
+  const payload = JSON.stringify(event);
+  for (const client of kitchenClients) {
+    client.send(payload);
+  }
+}
+
+function createKitchenOrder(orderSummary: string): KitchenOrder {
+  const order: KitchenOrder = {
+    id: `ORD-${String(kitchenOrders.length + 1).padStart(3, "0")}`,
+    items: extractOrderItems(orderSummary),
+    createdAt: new Date().toISOString(),
+    status: "nuevo",
+  };
+
+  kitchenOrders.unshift(order);
+  broadcastKitchenEvent({ type: "order_created", order });
+  return order;
+}
+
+function updateKitchenOrderStatus(
+  orderId: string,
+  status: KitchenOrderStatus
+): KitchenOrder | undefined {
+  const order = kitchenOrders.find((candidate) => candidate.id === orderId);
+  if (!order) return undefined;
+
+  order.status = status;
+  broadcastKitchenEvent({ type: "order_status_updated", order });
+  return order;
+}
 
 const addToOrder = tool(
   async ({ item, quantity }) => {
@@ -54,7 +108,8 @@ const addToOrder = tool(
 
 const confirmOrder = tool(
   async ({ orderSummary }) => {
-    return `Order confirmed: ${orderSummary}. Sending to kitchen.`;
+    const order = createKitchenOrder(orderSummary);
+    return `Order ${order.id} confirmed: ${orderSummary}. Sending to kitchen.`;
   },
   {
     name: "confirm_order",
@@ -279,7 +334,40 @@ async function* ttsStream(
   }
 }
 
-app.get("/*", serveStatic({ root: STATIC_DIR }));
+app.get("/api/orders", (c) => c.json({ orders: kitchenOrders }));
+
+app.get("/kitchen", (c) =>
+  c.html(readFileSync(path.join(STATIC_DIR, "index.html"), "utf-8"))
+);
+
+app.get(
+  "/kitchen-ws",
+  upgradeWebSocket(() => {
+    return {
+      onOpen(_, ws) {
+        kitchenClients.add(ws);
+        ws.send(
+          JSON.stringify({
+            type: "orders_snapshot",
+            orders: kitchenOrders,
+          } satisfies KitchenServerEvent)
+        );
+      },
+      onMessage(event) {
+        const message = JSON.parse(String(event.data)) as KitchenClientEvent;
+        if (
+          message.type === "update_order_status" &&
+          validKitchenStatuses.includes(message.status)
+        ) {
+          updateKitchenOrderStatus(message.orderId, message.status);
+        }
+      },
+      onClose(_, ws) {
+        kitchenClients.delete(ws);
+      },
+    };
+  })
+);
 
 app.get(
   "/ws",
@@ -325,6 +413,8 @@ app.get(
     };
   })
 );
+
+app.get("/*", serveStatic({ root: STATIC_DIR }));
 
 const server = serve({
   fetch: app.fetch,

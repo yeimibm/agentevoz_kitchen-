@@ -1,13 +1,15 @@
 import asyncio
 import contextlib
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal, TypedDict
 from uuid import uuid4
 
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from langchain.agents import create_agent
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableGenerator
@@ -27,7 +29,8 @@ from events import (
 )
 from utils import merge_async_iters
 
-load_dotenv()
+ROOT_DIR = Path(__file__).resolve().parents[3]
+load_dotenv(ROOT_DIR / ".env")
 
 # Static files are served from the shared web build output
 STATIC_DIR = Path(__file__).parent.parent.parent / "web" / "dist"
@@ -49,6 +52,73 @@ app.add_middleware(
 )
 
 
+KitchenOrderStatus = Literal["nuevo", "en preparación", "listo"]
+
+
+class KitchenOrder(TypedDict):
+    id: str
+    items: list[str]
+    createdAt: str
+    status: KitchenOrderStatus
+
+
+VALID_KITCHEN_STATUSES: set[KitchenOrderStatus] = {
+    "nuevo",
+    "en preparación",
+    "listo",
+}
+kitchen_orders: list[KitchenOrder] = []
+kitchen_clients: set[WebSocket] = set()
+
+
+def extract_order_items(order_summary: str) -> list[str]:
+    items = [
+        item.strip().lstrip("-*").strip()
+        for chunk in order_summary.replace(" y ", ",").replace(";", ",").split("\n")
+        for item in chunk.split(",")
+    ]
+    return [item for item in items if item]
+
+
+async def broadcast_kitchen_event(event: dict) -> None:
+    stale_clients: list[WebSocket] = []
+    for client in kitchen_clients:
+        try:
+            await client.send_json(event)
+        except RuntimeError:
+            stale_clients.append(client)
+
+    for client in stale_clients:
+        kitchen_clients.discard(client)
+
+
+def create_kitchen_order(order_summary: str) -> KitchenOrder:
+    order: KitchenOrder = {
+        "id": f"ORD-{len(kitchen_orders) + 1:03d}",
+        "items": extract_order_items(order_summary),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "status": "nuevo",
+    }
+    kitchen_orders.insert(0, order)
+    asyncio.create_task(broadcast_kitchen_event({"type": "order_created", "order": order}))
+    return order
+
+
+def update_kitchen_order_status(
+    order_id: str, status: KitchenOrderStatus
+) -> KitchenOrder | None:
+    for order in kitchen_orders:
+        if order["id"] == order_id:
+            order["status"] = status
+            asyncio.create_task(
+                broadcast_kitchen_event(
+                    {"type": "order_status_updated", "order": order}
+                )
+            )
+            return order
+    return None
+
+
 def add_to_order(item: str, quantity: int) -> str:
     """Add an item to the customer's sandwich order."""
     return f"Added {quantity} x {item} to the order."
@@ -56,7 +126,8 @@ def add_to_order(item: str, quantity: int) -> str:
 
 def confirm_order(order_summary: str) -> str:
     """Confirm the final order with the customer."""
-    return f"Order confirmed: {order_summary}. Sending to kitchen."
+    order = create_kitchen_order(order_summary)
+    return f"Order {order['id']} confirmed: {order_summary}. Sending to kitchen."
 
 
 system_prompt = """
@@ -277,6 +348,35 @@ pipeline = (
     | RunnableGenerator(_agent_stream)  # STT events -> STT + Agent events
     | RunnableGenerator(_tts_stream)  # STT + Agent events -> All events
 )
+
+
+@app.get("/api/orders")
+async def get_orders():
+    return {"orders": kitchen_orders}
+
+
+@app.get("/kitchen", response_class=HTMLResponse)
+async def kitchen_page():
+    return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+
+@app.websocket("/kitchen-ws")
+async def kitchen_websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    kitchen_clients.add(websocket)
+    await websocket.send_json({"type": "orders_snapshot", "orders": kitchen_orders})
+
+    try:
+        while True:
+            message = await websocket.receive_json()
+            status = message.get("status")
+            if (
+                message.get("type") == "update_order_status"
+                and status in VALID_KITCHEN_STATUSES
+            ):
+                update_kitchen_order_status(message.get("orderId", ""), status)
+    except WebSocketDisconnect:
+        kitchen_clients.discard(websocket)
 
 
 @app.websocket("/ws")

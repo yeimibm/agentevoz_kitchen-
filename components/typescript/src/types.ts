@@ -217,3 +217,23 @@ export type VoiceAgentEvent =
   | VoiceAgentEvent.STTEvent
   | VoiceAgentEvent.AgentEvent
   | VoiceAgentEvent.TTSChunk;
+
+export type KitchenOrderStatus = "nuevo" | "en preparación" | "listo";
+
+export interface KitchenOrder {
+  id: string;
+  items: string[];
+  createdAt: string;
+  status: KitchenOrderStatus;
+}
+
+export type KitchenClientEvent = {
+  type: "update_order_status";
+  orderId: string;
+  status: KitchenOrderStatus;
+};
+
+export type KitchenServerEvent =
+  | { type: "orders_snapshot"; orders: KitchenOrder[] }
+  | { type: "order_created"; order: KitchenOrder }
+  | { type: "order_status_updated"; order: KitchenOrder };
