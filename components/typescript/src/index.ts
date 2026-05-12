@@ -16,6 +16,7 @@ import { HumanMessage } from "@langchain/core/messages";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
+import OpenAI from "openai";
 import { CARTESIA_TTS_SYSTEM_PROMPT, CartesiaTTS } from "./cartesia";
 import { AssemblyAISTT } from "./assemblyai/index";
 import type {
@@ -131,12 +132,30 @@ Available cheeses: swiss, cheddar, provolone.
 ${CARTESIA_TTS_SYSTEM_PROMPT}
 `;
 
+const agentModel =
+  process.env.AGENT_MODEL ?? "openai:gpt-5.2";
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 const agent = createAgent({
-  model: "claude-haiku-4-5",
+  model: agentModel,
   tools: [addToOrder, confirmOrder],
   checkpointer: new MemorySaver(),
   systemPrompt: systemPrompt,
 });
+
+async function synthesizeWithOpenAI(text: string): Promise<VoiceAgentEvent.TTSChunk | null> {
+  if (!text.trim()) return null;
+
+  const response = await openai.audio.speech.create({
+    model: process.env.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts",
+    voice: process.env.OPENAI_TTS_VOICE ?? "alloy",
+    input: text,
+    response_format: "pcm",
+  });
+
+  const audio = Buffer.from(await response.arrayBuffer()).toString("base64");
+  return { type: "tts_chunk", audio, ts: Date.now() };
+}
 
 /**
  * Transform stream: Audio (Uint8Array) → Voice Events (VoiceAgentEvent)
@@ -228,9 +247,12 @@ async function* agentStream(
       );
 
       for await (const [message] of stream) {
-        if (AIMessage.isInstance(message) && message.tool_calls) {
-          yield { type: "agent_chunk", text: message.text, ts: Date.now() };
-          for (const toolCall of message.tool_calls) {
+        if (AIMessage.isInstance(message)) {
+          if (message.text) {
+            yield { type: "agent_chunk", text: message.text, ts: Date.now() };
+          }
+
+          for (const toolCall of message.tool_calls ?? []) {
             yield {
               type: "tool_call",
               id: toolCall.id ?? uuidv4(),
@@ -278,9 +300,13 @@ async function* agentStream(
 async function* ttsStream(
   eventStream: AsyncIterable<VoiceAgentEvent>
 ): AsyncGenerator<VoiceAgentEvent> {
-  const tts = new CartesiaTTS({
-    voiceId: "162e0f37-8504-474c-bb33-c606c01890dc",
-  });
+  const ttsProvider = (process.env.TTS_PROVIDER ?? "openai").toLowerCase();
+  const tts =
+    ttsProvider === "cartesia"
+      ? new CartesiaTTS({
+          voiceId: "162e0f37-8504-474c-bb33-c606c01890dc",
+        })
+      : null;
   const passthrough = writableIterator<VoiceAgentEvent>();
 
   /**
@@ -303,13 +329,21 @@ async function* ttsStream(
         }
         // Send all buffered text to Cartesia for synthesis
         if (event.type === "agent_end") {
-          await tts.sendText(buffer.join(""));
+          const text = buffer.join("");
+          if (tts) {
+            await tts.sendText(text);
+          } else {
+            const ttsChunk = await synthesizeWithOpenAI(text);
+            if (ttsChunk) {
+              passthrough.push(ttsChunk);
+            }
+          }
           buffer = [];
         }
       }
     } finally {
       // Signal to Cartesia that text sending is complete
-      await tts.close();
+      await tts?.close();
     }
   });
 
@@ -320,6 +354,8 @@ async function* ttsStream(
    * and pushing them into the passthrough iterator for downstream stages.
    */
   const consumer = iife(async () => {
+    if (!tts) return;
+
     for await (const event of tts.receiveEvents()) {
       passthrough.push(event);
     }
