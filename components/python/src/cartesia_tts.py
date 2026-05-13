@@ -35,7 +35,7 @@ def _ws_open_timeout_s() -> float:
 
 
 def _default_cartesia_language() -> str:
-    """Sonic `language` for the WebSocket payload (e.g. es, en). Not the same as AssemblyAI's query param."""
+    """Return Sonic `language` for the WebSocket payload, e.g. es or en."""
     raw = (os.getenv("CARTESIA_LANGUAGE") or "").strip().lower()
     if raw:
         return raw
@@ -63,6 +63,7 @@ class CartesiaTTS:
         ] = "pcm_s16le",
         language: Optional[str] = None,
         cartesia_version: str = "2025-04-16",
+        open_timeout: Optional[float] = None,
     ):
         self.api_key = api_key or os.getenv("CARTESIA_API_KEY")
         if not self.api_key:
@@ -72,16 +73,20 @@ class CartesiaTTS:
         self.model_id = model_id
         self.sample_rate = sample_rate
         self.encoding = encoding
-        self.language = (language or _default_cartesia_language()).strip().lower() or "en"
+        self.language = (
+            language or _default_cartesia_language()
+        ).strip().lower() or "en"
         self.cartesia_version = cartesia_version
         self._ws = None
         self._connection_signal = asyncio.Event()
         self._close_signal = asyncio.Event()
         self._context_counter = 0
-        self._open_timeout = _ws_open_timeout_s()
+        self._open_timeout = (
+            open_timeout if open_timeout is not None else _ws_open_timeout_s()
+        )
 
     async def prepare(self) -> None:
-        """Open the Cartesia WebSocket before merging streams (stable handshake vs TaskGroup cancel)."""
+        """Open the Cartesia WebSocket before merging streams."""
         await self._ensure_connection()
 
     def _generate_context_id(self) -> str:

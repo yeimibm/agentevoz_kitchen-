@@ -90,7 +90,7 @@ class AssemblyAISTT:
 
         self.sample_rate = sample_rate
         self.format_turns = format_turns
-        # Required by v3 streaming WebSocket; see AssemblyAI "Universal Streaming" API docs.
+        # Required by v3 streaming WebSocket; see AssemblyAI docs.
         self.speech_model = speech_model or os.getenv(
             "ASSEMBLYAI_SPEECH_MODEL", "universal-streaming-english"
         )
@@ -116,8 +116,8 @@ class AssemblyAISTT:
                 normalized if normalized == "en" else None
             )
 
-        # Turn detection: higher min silence / confidence = wait longer before end_of_turn.
-        # API defaults are min_turn_silence=400, max_turn_silence=1280, end_of_turn_confidence_threshold=0.4.
+        # Turn detection: higher min silence/confidence waits longer.
+        # API defaults: 400 ms, 1280 ms, threshold 0.4.
         self.min_turn_silence_ms = (
             min_turn_silence_ms
             if min_turn_silence_ms is not None

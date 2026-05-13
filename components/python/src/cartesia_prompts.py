@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """
 Cartesia TTS-optimized system prompt guidelines.
 

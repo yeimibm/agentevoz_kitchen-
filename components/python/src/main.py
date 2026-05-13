@@ -29,6 +29,19 @@ from events import (
 )
 from utils import merge_async_iters
 
+# Global event loop reference for thread-safe async calls
+event_loop_ref: asyncio.AbstractEventLoop | None = None
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Capture the event loop on startup."""
+    global event_loop_ref
+    event_loop_ref = asyncio.get_running_loop()
+    yield
+    event_loop_ref = None
+
+
 ROOT_DIR = Path(__file__).resolve().parents[3]
 load_dotenv(ROOT_DIR / ".env")
 
@@ -41,7 +54,7 @@ if not STATIC_DIR.exists():
         "Run 'make build-web' or 'make dev-py' from the project root."
     )
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -100,7 +113,11 @@ def create_kitchen_order(order_summary: str) -> KitchenOrder:
         "status": "nuevo",
     }
     kitchen_orders.insert(0, order)
-    asyncio.create_task(broadcast_kitchen_event({"type": "order_created", "order": order}))
+    if event_loop_ref is not None:
+        asyncio.run_coroutine_threadsafe(
+            broadcast_kitchen_event({"type": "order_created", "order": order}),
+            event_loop_ref
+        )
     return order
 
 
@@ -110,11 +127,13 @@ def update_kitchen_order_status(
     for order in kitchen_orders:
         if order["id"] == order_id:
             order["status"] = status
-            asyncio.create_task(
-                broadcast_kitchen_event(
-                    {"type": "order_status_updated", "order": order}
+            if event_loop_ref is not None:
+                asyncio.run_coroutine_threadsafe(
+                    broadcast_kitchen_event(
+                        {"type": "order_status_updated", "order": order}
+                    ),
+                    event_loop_ref
                 )
-            )
             return order
     return None
 
@@ -131,7 +150,8 @@ def confirm_order(order_summary: str) -> str:
 
 
 system_prompt = """
-Tu eres un asistente de un restaurante de sandwiches. Tu objetivo es tomar el pedido del cliente y confirmar el pedido.
+Tu eres un asistente de un restaurante de sandwiches.
+Tu objetivo es tomar el pedido del cliente y confirmar el pedido.
 Se muy conciso y amigable.
 
 Toppings disponibles: lechuga, tomate, cebolla, pepinillos, mayonesa, mostaza.
@@ -407,4 +427,4 @@ app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
